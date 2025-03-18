@@ -1,6 +1,8 @@
 # -*- coding: ISO-8859-1 -*-
 # AdapCNV-pro
 # Author: YJ Yuan
+# This script performs copy number variation (CNV) analysis from BAM files.
+# It extracts features, optimizes parameters, performs segmentation, and calls CNVs.
 
 import numpy as np
 import pysam
@@ -15,15 +17,40 @@ from scipy.optimize import minimize
 import joblib
 import os
 import gzip
-import re  # ????????
+import re
 from pyod.models.iforest import IForest
 
+
 def system_model(binsize, threshold, step_size, rd_diff):
-    regularization = 0.1 * (binsize - 500)**2 + 0.1 * (threshold - 50)**2 + 0.1 * (step_size - 0.1)**2
+    """
+    System model function that computes an objective value based on the read depth differences and parameters.
+
+    Parameters:
+        binsize (float): Bin size.
+        threshold (float): Threshold parameter.
+        step_size (float): Step size parameter.
+        rd_diff (array-like): Array of read depth differences.
+
+    Returns:
+        float: Computed objective value.
+    """
+    regularization = 0.1 * (binsize - 500) ** 2 + 0.1 * (threshold - 50) ** 2 + 0.1 * (step_size - 0.1) ** 2
     return np.sum(np.abs(rd_diff)) * binsize - threshold + regularization
 
 
 def online_optimizer(rd_diff, binsize, threshold, step_size):
+    """
+    Optimizes the parameters binsize, threshold, and step_size online using the system model.
+
+    Parameters:
+        rd_diff (array-like): Array of read depth differences.
+        binsize (float): Initial bin size.
+        threshold (float): Initial threshold.
+        step_size (float): Initial step size.
+
+    Returns:
+        array: Optimized parameters [binsize, threshold, step_size].
+    """
     binsize = np.clip(binsize, 500, 10000)
     threshold = np.clip(threshold, 1, 2)
     step_size = np.clip(step_size, 0.01, 1)
@@ -33,27 +60,47 @@ def online_optimizer(rd_diff, binsize, threshold, step_size):
         return system_model(binsize, threshold, step_size, rd_diff)
 
     bounds = [(500, 10000), (1, 2), (0.01, 1)]
-    result = minimize(objective, [binsize, threshold, step_size], bounds=bounds, method='L-BFGS-B', options={'maxiter': 100})
+    result = minimize(objective, [binsize, threshold, step_size], bounds=bounds, method='L-BFGS-B',
+                      options={'maxiter': 100})
 
-    print(f"???: binsize={result.x[0]}, threshold={result.x[1]}, step_size={result.x[2]}")
+    print(f"Optimized parameters: binsize={result.x[0]}, threshold={result.x[1]}, step_size={result.x[2]}")
     return result.x
 
 
 class AMPCController:
+    """
+    Adaptive Model Parameter Controller.
+
+    This controller updates parameters (binsize, threshold, step_size) using an online optimizer.
+    """
+
     def __init__(self, binsize, threshold, step_size):
         self.binsize = binsize
         self.threshold = threshold
         self.step_size = step_size
 
     def update(self, rd_diff):
-        print(f"¸before: binsize={self.binsize}, threshold={self.threshold}, step_size={self.step_size}")
-        self.binsize, self.threshold, self.step_size = online_optimizer(rd_diff, self.binsize, self.threshold, self.step_size)
-        print(f"¸after: binsize={self.binsize}, threshold={self.threshold}, step_size={self.step_size}")
+        """
+        Update the controller parameters based on the read depth differences.
+
+        Parameters:
+            rd_diff (array-like): Array of read depth differences.
+        """
+        print(f"Before update: binsize={self.binsize}, threshold={self.threshold}, step_size={self.step_size}")
+        self.binsize, self.threshold, self.step_size = online_optimizer(rd_diff, self.binsize, self.threshold,
+                                                                        self.step_size)
+        print(f"After update: binsize={self.binsize}, threshold={self.threshold}, step_size={self.step_size}")
+
 
 def get_chrlist(filename):
     """
-    ?? BAM ????????????????????
-    ???['chr1', 'chr2', 'chr3', ?, 'chrX', 'chrY']
+    Retrieve the list of chromosome names from a BAM file.
+
+    Parameters:
+        filename (str): Path to the BAM file.
+
+    Returns:
+        list: A list of chromosome names, e.g. ['chr1', 'chr2', 'chr3', ..., 'chrX', 'chrY'].
     """
     samfile = pysam.AlignmentFile(filename, "rb", ignore_truncation=True)
     return list(samfile.references)
@@ -61,28 +108,31 @@ def get_chrlist(filename):
 
 def get_RC(filename, ReadCount, Mapq, target_chr, chrLen):
     """
-    ??????? target_chr ???????????????????? read ???
-    ???
-      filename   -- BAM ????
-      ReadCount  -- ????????????????? numpy ?????????
-      Mapq       -- ????? numpy ??????? mapq?
-      target_chr -- ?????????? "chr19"
-      chrLen     -- ?????????????
-    ???
-      ???? ReadCount??????Bpoint?? Mapq ??
+    Obtain read count and mapping quality for reads mapped to the target chromosome from a BAM file.
+    Updates the ReadCount and Mapq arrays based on read positions and collects reads with non-standard CIGAR strings.
+
+    Parameters:
+        filename (str): Path to the BAM file.
+        ReadCount (np.array): Array to store read counts.
+        Mapq (np.array): Array to store mapping quality scores.
+        target_chr (str): Target chromosome (e.g., "chr19").
+        chrLen (int): Length of the target chromosome.
+
+    Returns:
+        tuple: (Updated ReadCount array, breakpoint list, Updated Mapq array)
     """
     qname, flag, q_mapq, cigar = [], [], [], []
     pos, direction, isize, qlen = [], [], [], []
     samfile = pysam.AlignmentFile(filename, "rb", ignore_truncation=True)
 
-    # ????????????????? BAM ??????????? target_chr ???
+    # Iterate over reads mapped to the target chromosome in the BAM file
     for read in samfile.fetch(target_chr):
         posList = read.positions
-        # ???posList ???????? 0 ~ (chrLen-1) ???
+        # Update read counts for positions within 0 to (chrLen-1)
         ReadCount[posList] += 1
         Mapq[posList] += read.mapq
         if read.cigarstring is not None:
-            # ?? read ? cigar ????? M????????? mapq >= 10????????
+            # For reads with a non-standard CIGAR string (not full-match) and mapq >= 10, collect additional info
             cigarstring = str(read.query_length) + 'M'
             if read.cigarstring != cigarstring and read.mapq >= 10:
                 qname.append(read.qname)
@@ -93,17 +143,25 @@ def get_RC(filename, ReadCount, Mapq, target_chr, chrLen):
                 direction.append(read.is_read1)
                 isize.append(read.isize)
                 qlen.append(read.qlen)
-    # ?? DataFrame?????????
+    # Create a DataFrame from the collected read information
     SR = pd.DataFrame(list(zip(qname, flag, direction, q_mapq, cigar, pos, qlen)),
                       columns=['name', 'flag', 'dir', 'mapq', 'cigar', 'pos', 'len'])
-    # ?????? get_breakpoint2????? chrLen
+    # Get breakpoints using the collected data
     Bpoint = get_breakpoint2(SR, chrLen)
     return ReadCount, Bpoint, Mapq
 
 
 def get_breakpoint(read_cigar, read_pos, read_len):
     """
-    ?? read ? cigar ????????????????
+    Determine breakpoints from the CIGAR strings of reads.
+
+    Parameters:
+        read_cigar (array-like): Array of CIGAR strings.
+        read_pos (array-like): Array of read start positions.
+        read_len (array-like): Array of read lengths.
+
+    Returns:
+        list: A list of breakpoint positions.
     """
     breakpoint = []
     for i in range(len(read_cigar)):
@@ -126,9 +184,15 @@ def get_breakpoint(read_cigar, read_pos, read_len):
 
 def get_breakpoint2(SR, chrLen):
     """
-    ?? SR??? read ??? DataFrame????????
-    ?? chrLen ???????????
-    ?????????????? 0 ? chrLen-1?
+    Generate breakpoint positions from a DataFrame of read information.
+    Ensures that breakpoints are within the range [0, chrLen - 1].
+
+    Parameters:
+        SR (pd.DataFrame): DataFrame containing read information with columns such as 'name', 'cigar', 'pos', 'len', and 'dir'.
+        chrLen (int): Length of the chromosome.
+
+    Returns:
+        list: Sorted list of unique breakpoint positions.
     """
     breakpoint1 = []
     breakpoint2 = [0, chrLen - 1]
@@ -163,8 +227,13 @@ def get_breakpoint2(SR, chrLen):
 
 def read_ref_file(filename):
     """
-    ???? fasta ????? .fasta ? .fasta.gz?????????
-      refDict[ref_name] = ?????
+    Read a reference FASTA file (.fasta or .fasta.gz) and store sequences in a dictionary.
+
+    Parameters:
+        filename (str): Path to the reference FASTA file.
+
+    Returns:
+        dict: Dictionary with reference names as keys and sequences as values.
     """
     refDict = {}
     if os.path.exists(filename):
@@ -194,9 +263,25 @@ def read_ref_file(filename):
 
 
 def ReadDepth(ReadCount, ref, pos):
+    """
+    Compute read depth and GC content for genomic bins.
 
+    Parameters:
+        ReadCount (np.array): Array of read counts.
+        ref (str): Reference sequence for the chromosome.
+        pos (list): List of breakpoint positions.
+
+    Returns:
+        tuple: (bin_start, bin_end, bin_len, bin_RD, bin_gc)
+            bin_start: Array of bin start positions.
+            bin_end: Array of bin end positions.
+            bin_len: Array of bin lengths.
+            bin_RD: GC-corrected read depth for each bin.
+            bin_gc: GC content ratio for each bin.
+    """
     start = pos[:len(pos) - 1]
     end = pos[1:]
+    # Remove bins with length less than 500
     for i in range(len(pos) - 1):
         if end[i] - start[i] < 500:
             pos.remove(end[i])
@@ -206,13 +291,14 @@ def ReadDepth(ReadCount, ref, pos):
     length = end - start
     with open('pos.txt', 'w') as f:
         for i in range(len(start)):
-            linestrlist = ['1', '1', str(start[i]), str(end[i]-1), str(length[i])]
+            linestrlist = ['1', '1', str(start[i]), str(end[i] - 1), str(length[i])]
             f.write('\t'.join(linestrlist) + '\n')
-    bin_start,bin_end,bin_len,s = re_segfile('pos.txt', 'bin.txt', binSize)
+    # re_segfile is expected to segment the positions file based on binSize
+    bin_start, bin_end, bin_len, s = re_segfile('pos.txt', 'bin.txt', binSize)
     binNum = len(bin_start)
     bin_RD = np.full(binNum, 0.0)
     bin_GC = np.full(binNum, 0)
-    bin_gc = np.full(binNum,0.0)
+    bin_gc = np.full(binNum, 0.0)
     for i in range(binNum):
         bin_RD[i] = np.mean(ReadCount[bin_start[i]:bin_end[i]])
         cur_ref = ref[bin_start[i]:bin_end[i]]
@@ -223,7 +309,7 @@ def ReadDepth(ReadCount, ref, pos):
             bin_RD[i] = -10000
             gc_count = 0
         bin_GC[i] = int(round(gc_count / bin_len[i], 3) * 1000)
-        bin_gc[i] = round(gc_count / bin_len[i],2)
+        bin_gc[i] = round(gc_count / bin_len[i], 2)
     bin_end -= 1
 
     index = bin_RD > 0
@@ -234,11 +320,20 @@ def ReadDepth(ReadCount, ref, pos):
     bin_start = bin_start[index]
     bin_end = bin_end[index]
     bin_RD = gc_correct(bin_RD, bin_GC)
-    return bin_start,bin_end,bin_len, bin_RD, bin_gc
+    return bin_start, bin_end, bin_len, bin_RD, bin_gc
 
 
 def gc_correct(RD, GC):
+    """
+    Correct read depth for GC bias.
 
+    Parameters:
+        RD (np.array): Array of read depths.
+        GC (np.array): Array of GC content values.
+
+    Returns:
+        np.array: GC-corrected read depth.
+    """
     bincount = np.bincount(GC)
     global_rd_ave = np.mean(RD)
     for i in range(len(RD)):
@@ -250,7 +345,16 @@ def gc_correct(RD, GC):
 
 
 def prox_tv1d(step_size: float, w: np.ndarray) -> np.ndarray:
+    """
+    Compute the proximal operator for 1D total variation denoising.
 
+    Parameters:
+        step_size (float): The step size parameter.
+        w (np.ndarray): Input 1D array.
+
+    Returns:
+        np.ndarray: The denoised array.
+    """
     if w.dtype not in (np.float32, np.float64):
         raise ValueError('argument w must be array of floats')
     w = w.copy()
@@ -258,18 +362,30 @@ def prox_tv1d(step_size: float, w: np.ndarray) -> np.ndarray:
     _prox_tv1d(step_size, w, output)
     return output
 
+
 @njit
 def _prox_tv1d(step_size, input, output):
-    """low level function call, no checks are performed"""
+    """
+    Low-level function to compute the proximal operator for 1D total variation denoising.
+    No input validation is performed.
+
+    Parameters:
+        step_size (float): The step size parameter.
+        input (np.ndarray): Input 1D array.
+        output (np.ndarray): Array to store the result.
+
+    Returns:
+        None
+    """
     width = input.size + 1
     index_low = np.zeros(width, dtype=np.int32)
     slope_low = np.zeros(width, dtype=input.dtype)
-    index_up  = np.zeros(width, dtype=np.int32)
-    slope_up  = np.zeros(width, dtype=input.dtype)
-    index     = np.zeros(width, dtype=np.int32)
-    z         = np.zeros(width, dtype=input.dtype)
-    y_low     = np.empty(width, dtype=input.dtype)
-    y_up      = np.empty(width, dtype=input.dtype)
+    index_up = np.zeros(width, dtype=np.int32)
+    slope_up = np.zeros(width, dtype=input.dtype)
+    index = np.zeros(width, dtype=np.int32)
+    z = np.zeros(width, dtype=input.dtype)
+    y_low = np.empty(width, dtype=input.dtype)
+    y_up = np.empty(width, dtype=input.dtype)
     s_low, c_low, s_up, c_up, c = 0, 0, 0, 0, 0
     y_low[0] = y_up[0] = 0
     y_low[1] = input[0] - step_size
@@ -277,11 +393,11 @@ def _prox_tv1d(step_size, input, output):
     incr = 1
 
     for i in range(2, width):
-        y_low[i] = y_low[i-1] + input[(i - 1) * incr]
-        y_up[i] = y_up[i-1] + input[(i - 1) * incr]
+        y_low[i] = y_low[i - 1] + input[(i - 1) * incr]
+        y_up[i] = y_up[i - 1] + input[(i - 1) * incr]
 
-    y_low[width-1] += step_size
-    y_up[width-1] -= step_size
+    y_low[width - 1] += step_size
+    y_up[width - 1] -= step_size
     slope_low[0] = np.inf
     slope_up[0] = -np.inf
     z[0] = y_low[0]
@@ -290,46 +406,46 @@ def _prox_tv1d(step_size, input, output):
         c_low += 1
         c_up += 1
         index_low[c_low] = index_up[c_up] = i
-        slope_low[c_low] = y_low[i]-y_low[i-1]
-        while (c_low > s_low+1) and (slope_low[max(s_low, c_low-1)] <= slope_low[c_low]):
+        slope_low[c_low] = y_low[i] - y_low[i - 1]
+        while (c_low > s_low + 1) and (slope_low[max(s_low, c_low - 1)] <= slope_low[c_low]):
             c_low -= 1
             index_low[c_low] = i
-            if c_low > s_low+1:
-                slope_low[c_low] = (y_low[i]-y_low[index_low[c_low-1]]) / (i-index_low[c_low-1])
+            if c_low > s_low + 1:
+                slope_low[c_low] = (y_low[i] - y_low[index_low[c_low - 1]]) / (i - index_low[c_low - 1])
             else:
-                slope_low[c_low] = (y_low[i]-z[c]) / (i-index[c])
+                slope_low[c_low] = (y_low[i] - z[c]) / (i - index[c])
 
-        slope_up[c_up] = y_up[i]-y_up[i-1]
-        while (c_up > s_up+1) and (slope_up[max(c_up-1, s_up)] >= slope_up[c_up]):
+        slope_up[c_up] = y_up[i] - y_up[i - 1]
+        while (c_up > s_up + 1) and (slope_up[max(c_up - 1, s_up)] >= slope_up[c_up]):
             c_up -= 1
             index_up[c_up] = i
             if c_up > s_up + 1:
-                slope_up[c_up] = (y_up[i]-y_up[index_up[c_up-1]]) / (i-index_up[c_up-1])
+                slope_up[c_up] = (y_up[i] - y_up[index_up[c_up - 1]]) / (i - index_up[c_up - 1])
             else:
-                slope_up[c_up] = (y_up[i]-z[c]) / (i-index[c])
+                slope_up[c_up] = (y_up[i] - z[c]) / (i - index[c])
 
-        while (c_low == s_low+1) and (c_up > s_up+1) and (slope_low[c_low] >= slope_up[s_up+1]):
+        while (c_low == s_low + 1) and (c_up > s_up + 1) and (slope_low[c_low] >= slope_up[s_up + 1]):
             c += 1
             s_up += 1
             index[c] = index_up[s_up]
             z[c] = y_up[index[c]]
             index_low[s_low] = index[c]
-            slope_low[c_low] = (y_low[i]-z[c]) / (i-index[c])
-        while (c_up == s_up+1) and (c_low>s_low+1) and (slope_up[c_up]<=slope_low[s_low+1]):
+            slope_low[c_low] = (y_low[i] - z[c]) / (i - index[c])
+        while (c_up == s_up + 1) and (c_low > s_low + 1) and (slope_up[c_up] <= slope_low[s_low + 1]):
             c += 1
             s_low += 1
             index[c] = index_low[s_low]
             z[c] = y_low[index[c]]
             index_up[s_up] = index[c]
-            slope_up[c_up] = (y_up[i]-z[c]) / (i-index[c])
+            slope_up[c_up] = (y_up[i] - z[c]) / (i - index[c])
 
     for i in range(1, c_low - s_low + 1):
-        index[c+i] = index_low[s_low+i]
-        z[c+i] = y_low[index[c+i]]
-    c = c + c_low-s_low
+        index[c + i] = index_low[s_low + i]
+        z[c + i] = y_low[index[c + i]]
+    c = c + c_low - s_low
     j, i = 0, 1
     while i <= c:
-        a = (z[i]-z[i-1]) / (index[i]-index[i-1])
+        a = (z[i] - z[i - 1]) / (index[i] - index[i - 1])
         while j < index[i]:
             output[j * incr] = a
             output[j * incr] = a
@@ -340,7 +456,17 @@ def _prox_tv1d(step_size, input, output):
 
 @njit
 def prox_tv1d_cols(stepsize, a, n_rows, n_cols):
-    """apply prox_tv1d along columns of the matri a
+    """
+    Apply prox_tv1d along the columns of a matrix.
+
+    Parameters:
+        stepsize (float): The step size parameter.
+        a (np.ndarray): Input array (flattened matrix).
+        n_rows (int): Number of rows in the matrix.
+        n_cols (int): Number of columns in the matrix.
+
+    Returns:
+        np.ndarray: The processed array after applying the proximal operator to each column.
     """
     A = a.reshape((n_rows, n_cols))
     out = np.empty_like(A)
@@ -351,7 +477,17 @@ def prox_tv1d_cols(stepsize, a, n_rows, n_cols):
 
 @njit
 def prox_tv1d_rows(stepsize, a, n_rows, n_cols):
-    """apply prox_tv1d along rows of the matri a
+    """
+    Apply prox_tv1d along the rows of a matrix.
+
+    Parameters:
+        stepsize (float): The step size parameter.
+        a (np.ndarray): Input array (flattened matrix).
+        n_rows (int): Number of rows in the matrix.
+        n_cols (int): Number of columns in the matrix.
+
+    Returns:
+        np.ndarray: The processed array after applying the proximal operator to each row.
     """
     A = a.reshape((n_rows, n_cols))
     out = np.empty_like(A)
@@ -360,10 +496,21 @@ def prox_tv1d_rows(stepsize, a, n_rows, n_cols):
     return out.ravel()
 
 
-def Read_seg_file(binstart,binlen,binend,bingc):
+def Read_seg_file(binstart, binlen, binend, bingc):
     """
-    read segment file (Generated by DNAcopy.segment)
-    seg file: col, chr, start, end, num_mark, seg_mean
+    Read and adjust a segmentation file (generated by DNAcopy.segment).
+
+    The segmentation file is expected to have columns:
+      col, chr, start, end, num_mark, seg_mean
+
+    Parameters:
+        binstart (array-like): Array of bin start positions.
+        binlen (array-like): Array of bin lengths.
+        binend (array-like): Array of bin end positions.
+        bingc (array-like): Array of GC content values for bins.
+
+    Returns:
+        tuple: (reseg_Start, reseg_End, reseg_Len, reseg_gc)
     """
     seg_start = []
     seg_end = []
@@ -372,10 +519,9 @@ def Read_seg_file(binstart,binlen,binend,bingc):
     seg_pos = []
     for i in range(len(binstart) - 1):
         if binstart[i] + binlen[i] != binstart[i + 1]:
-            location.append(i+1)
+            location.append(i + 1)
     count = 0
-    with open("seg", 'r') as f1,\
-            open('seg2.txt', 'w') as f2:
+    with open("seg", 'r') as f1, open('seg2.txt', 'w') as f2:
         for line in f1:
             linestrlist = line.strip().split('\t')
             start = int(linestrlist[2])
@@ -388,28 +534,40 @@ def Read_seg_file(binstart,binlen,binend,bingc):
                     seg_pos[-1].append(j)
                     seg_pos[-1].append(j + 1)
                     seg_pos[-1] = sorted(seg_pos[-1])
-            for k in range(0,len(seg_pos[count]),2):
+            for k in range(0, len(seg_pos[count]), 2):
                 start = seg_pos[count][k] - 1
-                end = seg_pos[count][k+1]-1
+                end = seg_pos[count][k + 1] - 1
                 linestrlist[2] = str(binstart[seg_pos[count][k] - 1])
-                seg_start.append(seg_pos[count][k]-1)
-                linestrlist[3] = str(binend[seg_pos[count][k+1]-1])#
-                linestrlist[4] = str(np.sum(binlen[seg_pos[count][k] - 1:seg_pos[count][k+1]]))
-                seg_end.append(seg_pos[count][k+1]-1)
+                seg_start.append(seg_pos[count][k] - 1)
+                linestrlist[3] = str(binend[seg_pos[count][k + 1] - 1])
+                linestrlist[4] = str(np.sum(binlen[seg_pos[count][k] - 1:seg_pos[count][k + 1]]))
+                seg_end.append(seg_pos[count][k + 1] - 1)
                 seg_len.append(np.sum(binlen[start:end + 1]))
                 linestrlist.append('')
-                linestrlist[6] = (str(np.mean(bingc[start:end+1])))
+                linestrlist[6] = (str(np.mean(bingc[start:end + 1])))
                 f2.write('\t'.join(linestrlist) + '\n')
             count += 1
-    reseg_Start,reseg_End,reseg_Len,reseg_gc = re_segfile('seg2.txt','reseg.txt',reseg_len)
+    reseg_Start, reseg_End, reseg_Len, reseg_gc = re_segfile('seg2.txt', 'reseg.txt', reseg_len)
     return reseg_Start, reseg_End, reseg_Len, reseg_gc
 
 
 def PCC(data):
-    rdmq_1 = np.array(data[['rd','gc','mq']])
-    clf = IForest()  # ??IsolationForest??????
+    """
+    Perform preliminary CNV calling using read depth (rd), GC content (gc), and mapping quality (mq) as features.
+
+    This function uses the IsolationForest model for anomaly detection and Otsu's method to determine a threshold.
+    It then combines adjacent CNV segments.
+
+    Parameters:
+        data (pd.DataFrame): DataFrame containing columns 'rd', 'gc', and 'mq'.
+
+    Returns:
+        pd.DataFrame: Final combined CNV calls.
+    """
+    rdmq_1 = np.array(data[['rd', 'gc', 'mq']])
+    clf = IForest()  # Use IsolationForest for anomaly detection
     clf.fit(rdmq_1)
-    scores_1 = clf.decision_function(rdmq_1)  # ??????
+    scores_1 = clf.decision_function(rdmq_1)  # Compute anomaly scores
     data['scores'] = scores_1
     threshold_1 = Otsu(scores_1)
     CNV_1 = get_CNV(data, threshold_1)
@@ -430,9 +588,20 @@ def PCC(data):
 
 
 def resegment_RD(RD, MQ, start, end):
+    """
+    Re-segment read depth (RD) and mapping quality (MQ) data based on given start and end positions.
 
-    reseg_RD = np.full(len(start),0.0)
-    reseg_MQ = np.full(len(start),0.0)
+    Parameters:
+        RD (np.array): Array of read depths.
+        MQ (np.array): Array of mapping quality scores.
+        start (list): List of segment start positions.
+        end (list): List of segment end positions.
+
+    Returns:
+        tuple: (reseg_RD, reseg_MQ, reseg_start, reseg_end)
+    """
+    reseg_RD = np.full(len(start), 0.0)
+    reseg_MQ = np.full(len(start), 0.0)
     reseg_start = []
     reseg_end = []
 
@@ -445,9 +614,19 @@ def resegment_RD(RD, MQ, start, end):
     return reseg_RD, reseg_MQ, reseg_start, reseg_end
 
 
-def re_segfile(filname,savefile,reseg_length):
-    with open(filname,'r') as f1, \
-            open(savefile,'w') as f2:
+def re_segfile(filname, savefile, reseg_length):
+    """
+    Resegment a file containing segment information if the segment length exceeds a given threshold.
+
+    Parameters:
+        filname (str): Input file name containing segment information.
+        savefile (str): Temporary file name to save resegmented data.
+        reseg_length (int): Length threshold for resegmentation.
+
+    Returns:
+        tuple: (tran_start, tran_end, tran_len, tran_gc) arrays after resegmentation.
+    """
+    with open(filname, 'r') as f1, open(savefile, 'w') as f2:
         for line in f1:
             linestrlist = line.strip().split('\t')
             length = int(linestrlist[4])
@@ -461,14 +640,14 @@ def re_segfile(filname,savefile,reseg_length):
                                 linestrlist[3] = str(int(linestrlist[2]) + reseg_length - 1)
                                 linestrlist[4] = str(reseg_length)
                                 f2.write('\t'.join(linestrlist) + '\n')
-                            elif i+1 != reseg_num:
+                            elif i + 1 != reseg_num:
                                 linestrlist[2] = str(int(linestrlist[2]) + 1 * reseg_length)
-                                linestrlist[3] = str(int(linestrlist[2]) + reseg_length - 1 )
+                                linestrlist[3] = str(int(linestrlist[2]) + reseg_length - 1)
                                 linestrlist[4] = str(reseg_length)
                                 f2.write('\t'.join(linestrlist) + '\n')
                             else:
                                 linestrlist[2] = str(int(linestrlist[2]) + 1 * reseg_length)
-                                linestrlist[3] = str(int(linestrlist[2])  + l - 1)
+                                linestrlist[3] = str(int(linestrlist[2]) + l - 1)
                                 linestrlist[4] = str(l)
                                 f2.write('\t'.join(linestrlist) + '\n')
 
@@ -476,16 +655,16 @@ def re_segfile(filname,savefile,reseg_length):
                         bin_num = length // reseg_length
                         for i in range(bin_num):
                             if i == 0:
-                                if i+1 != bin_num:
+                                if i + 1 != bin_num:
                                     linestrlist[3] = str(int(linestrlist[2]) + reseg_length - 1)
                                     linestrlist[4] = str(reseg_length)
                                 else:
                                     linestrlist[3] = str(int(linestrlist[2]) + reseg_length - 1 + l)
                                     linestrlist[4] = str(reseg_length + l)
                                 f2.write('\t'.join(linestrlist) + '\n')
-                            elif i+1 != bin_num:
+                            elif i + 1 != bin_num:
                                 linestrlist[2] = str(int(linestrlist[2]) + 1 * reseg_length)
-                                linestrlist[3] = str(int(linestrlist[2]) + reseg_length - 1 )
+                                linestrlist[3] = str(int(linestrlist[2]) + reseg_length - 1)
                                 linestrlist[4] = str(reseg_length)
                                 f2.write('\t'.join(linestrlist) + '\n')
                             else:
@@ -497,7 +676,7 @@ def re_segfile(filname,savefile,reseg_length):
                 else:
                     bin_num = length // reseg_length
                     for i in range(bin_num):
-                        if i==0:
+                        if i == 0:
                             linestrlist[3] = str(int(linestrlist[2]) + reseg_length - 1)
                             linestrlist[4] = str(reseg_length)
                             f2.write('\t'.join(linestrlist) + '\n')
@@ -520,17 +699,26 @@ def re_segfile(filname,savefile,reseg_length):
             tran_end.append(int(linestrinfo[3]) + 1)
             tran_len.append(int(linestrinfo[4]))
             if len(linestrinfo) > 5:
-                tran_gc.append(round(float(linestrinfo[6]),2))
+                tran_gc.append(round(float(linestrinfo[6]), 2))
 
     tran_start = np.array(tran_start)
     tran_end = np.array(tran_end)
     tran_len = np.array(tran_len)
     os.remove(filname)
     os.remove(savefile)
-    return tran_start, tran_end, tran_len,tran_gc
+    return tran_start, tran_end, tran_len, tran_gc
 
 
 def get_newbins(new_data):
+    """
+    Extract new bin arrays from a DataFrame containing CNV data.
+
+    Parameters:
+        new_data (pd.DataFrame): DataFrame with columns 'chr', 'start', 'end', 'rd', 'gc', and 'mq'.
+
+    Returns:
+        tuple: Arrays (new_chr, new_start, new_end, new_rd, new_gc, new_mq).
+    """
     new_chr = np.array(new_data['chr'])
     new_start = np.array(new_data['start'])
     new_end = np.array(new_data['end'])
@@ -538,41 +726,48 @@ def get_newbins(new_data):
     new_gc = np.array(new_data['gc'])
     new_mq = np.array(new_data['mq'])
 
-    return new_chr,new_start,new_end,new_rd,new_gc,new_mq
+    return new_chr, new_start, new_end, new_rd, new_gc, new_mq
 
 
 def Otsu(S):
-    S = np.round(S,2)
+    """
+    Determine an optimal threshold using Otsu's method on an array of scores.
+
+    Parameters:
+        S (np.array): Array of scores (e.g., from the IsolationForest decision function).
+
+    Returns:
+        float: Optimal threshold value.
+    """
+    S = np.round(S, 2)
     min_S = np.min(S)
     median_S = np.median(S)
-    lower_S = np.quantile(S,0.35,interpolation='lower')
-    higer_S = np.quantile(S,0.85,interpolation='higher')
-    if(lower_S == min_S):
+    lower_S = np.quantile(S, 0.35, interpolation='lower')
+    higer_S = np.quantile(S, 0.85, interpolation='higher')
+    if lower_S == min_S:
         lower_S += 0.1
     final_threshold = median_S
     max_var = 0.0
     D_labels = np.full(len(S), 0)
-    for i in np.arange(lower_S,higer_S,0.01):
-        cur_threshold = round(i,2)
+    for i in np.arange(lower_S, higer_S, 0.01):
+        cur_threshold = round(i, 2)
         D0_index = (S < cur_threshold)
         D1_index = (S >= cur_threshold)
 
         D_labels[D0_index] = 0
         D_labels[D1_index] = 1
-        D0 = S[D0_index]
-        D1 = S[D1_index]
-        S_resample = S.reshape(-1,1)
+        S_resample = S.reshape(-1, 1)
 
-        new_D,new_label = RandomUnderSampler(random_state=42).fit_resample(S_resample,D_labels)
-        new_D0 = new_D.ravel()[new_label==0]
-        new_D1 = new_D.ravel()[new_label==1]
+        new_D, new_label = RandomUnderSampler(random_state=42).fit_resample(S_resample, D_labels)
+        new_D0 = new_D.ravel()[new_label == 0]
+        new_D1 = new_D.ravel()[new_label == 1]
 
         D0_mean = np.mean(new_D0)
         D1_mean = np.mean(new_D1)
-        p0 = len(D0)/(len(D0)+len(D1))
+        p0 = len(D0) / (len(D0) + len(D1))
         p1 = (1 - p0)
-        S_mean = p0*D0_mean + p1*D1_mean
-        cur_var = p0*(D0_mean - S_mean)**2 + p1*(D1_mean - S_mean)**2
+        S_mean = p0 * D0_mean + p1 * D1_mean
+        cur_var = p0 * (D0_mean - S_mean) ** 2 + p1 * (D1_mean - S_mean) ** 2
         if cur_var > max_var:
             final_threshold = cur_threshold
             max_var = cur_var
@@ -580,10 +775,19 @@ def Otsu(S):
     return final_threshold
 
 
-def get_CNV(data,threshold):
+def get_CNV(data, threshold):
+    """
+    Identify CNV segments from data using a specified threshold on anomaly scores.
 
-    CNVindex = data[np.round(data['scores'],2) >= threshold].index
-    Normalindex = data[np.round(data['scores'],2) < threshold].index
+    Parameters:
+        data (pd.DataFrame): DataFrame containing 'rd', 'gc', 'mq', and 'scores'.
+        threshold (float): Threshold for calling CNVs.
+
+    Returns:
+        pd.DataFrame: DataFrame containing identified CNV segments with additional information.
+    """
+    CNVindex = data[np.round(data['scores'], 2) >= threshold].index
+    Normalindex = data[np.round(data['scores'], 2) < threshold].index
     Normalmean = (data['rd'].iloc[Normalindex]).mean()
     gc_mean = (data['gc'].iloc[Normalindex]).mean()
     base = Normalmean * 0.25
@@ -606,8 +810,16 @@ def get_CNV(data,threshold):
 
 
 def combineCNV(CNVdata):
+    """
+    Combine adjacent CNV segments of the same type.
 
-    CNVchr,CNVstart,CNVend,CNVRD,CNVgc,CNVmq = get_newbins(CNVdata)
+    Parameters:
+        CNVdata (pd.DataFrame): DataFrame containing CNV segments with columns such as 'chr', 'start', 'end', 'rd', 'gc', 'mq', and 'type'.
+
+    Returns:
+        pd.DataFrame: DataFrame with combined CNV segments.
+    """
+    CNVchr, CNVstart, CNVend, CNVRD, CNVgc, CNVmq = get_newbins(CNVdata)
     CNVlen = CNVend - CNVstart + 1
     typeCNV = np.array(CNVdata['type'])
     for i in range(len(CNVRD) - 1):
@@ -617,7 +829,7 @@ def combineCNV(CNVdata):
                 CNVstart[i + 1] = CNVstart[i]
                 CNVlen[i + 1] = CNVend[i + 1] - CNVstart[i + 1] + 1
                 typeCNV[i] = 0
-                CNVRD[i + 1] = (CNVRD[i] + CNVRD[i+1]) / 2
+                CNVRD[i + 1] = (CNVRD[i] + CNVRD[i + 1]) / 2
                 CNVmq[i + 1] = (CNVmq[i] + CNVmq[i + 1]) / 2
                 CNVgc[i + 1] = (CNVgc[i] + CNVgc[i + 1]) / 2
     index = typeCNV != 0
@@ -636,13 +848,19 @@ def combineCNV(CNVdata):
 
     return final_CNV
 
-'''
- use rd, gc and mq as features
 
-'''
-
+# Use read depth (rd), GC content (gc) and mapping quality (mq) as features
 
 def calculate_gc_content(sequence):
+    """
+    Calculate the GC content of a given sequence.
+
+    Parameters:
+        sequence (str): DNA sequence.
+
+    Returns:
+        float: GC content ratio.
+    """
     g = sequence.upper().count('G')
     c = sequence.upper().count('C')
     return (g + c) / len(sequence) if len(sequence) > 0 else 0
@@ -650,51 +868,63 @@ def calculate_gc_content(sequence):
 
 def extract_features(bam_file, window_size=5000, threshold=0.2, normal_bam='normal.bam', targets_bed='targets.bed',
                      reference='reference.fasta', output_dir='output'):
-    bam_file = pysam.AlignmentFile(bam_file, "rb")
+    """
+    Extract coverage-based features from a BAM file.
+
+    Features include:
+        - Mean coverage
+        - Standard deviation of coverage
+        - Peak coverage
+        - Fraction of positions with coverage greater than twice the mean (repeat fraction)
+
+    Parameters:
+        bam_file (str): Path to the BAM file.
+        window_size (int): Window size for feature extraction.
+        threshold (float): Threshold for coverage analysis.
+        normal_bam (str): Path to a normal BAM file (unused in current implementation).
+        targets_bed (str): Path to a BED file with target regions (unused in current implementation).
+        reference (str): Path to the reference FASTA file (unused in current implementation).
+        output_dir (str): Directory to store output files.
+
+    Returns:
+        dict: Dictionary of extracted features.
+    """
+    bam_file_obj = pysam.AlignmentFile(bam_file, "rb")
     coverage = []
-    #gc_content = []
-
-    for pileupcolumn in bam_file.pileup():
+    # Iterate over each pileup column to obtain coverage information
+    for pileupcolumn in bam_file_obj.pileup():
         coverage.append(pileupcolumn.n)
-        #seq = ''
-        #for pileupread in bam.fetch(reference=pileupcolumn.reference_name, start=pileupcolumn.pos, end=pileupcolumn.pos + 1):
-            #seq += pileupread.query_sequence if pileupread.query_sequence else ''
-        #gc_content.append(calculate_gc_content(seq))
-
-    bam_file.close()
+    bam_file_obj.close()
 
     coverage = np.array(coverage)
     mean_coverage = np.mean(coverage)
     stddev_coverage = np.std(coverage)
     peak_coverage = np.max(coverage)
     repeat_fraction = np.sum(coverage > mean_coverage * 2) / len(coverage)
-    #mean_gc_content = np.mean(gc_content)
 
     features = {
-        #'bam_file': bam_file,
         'mean_coverage': mean_coverage,
         'stddev_coverage': stddev_coverage,
         'peak_coverage': peak_coverage,
         'repeat_fraction': repeat_fraction,
-        #'gc_content': mean_gc_content,
     }
 
     return features
 
 
 if __name__ == "__main__":
-    # ??????bam_file, reference, outfile, reseg_len
+    # Command-line arguments: bam_file, reference, outfile, reseg_len
     bam_file = sys.argv[1]
     reference = sys.argv[2]
     outfile = sys.argv[3]
     reseg_len = int(sys.argv[4])
 
-    # ???????????????????????
+    # Target chromosome for analysis
     target_chr = "chr19"
 
     print("Current working directory:", os.getcwd())
 
-    # ?? BAM ????????? extract_features ?????????
+    # Extract features from the BAM file
     features = extract_features(bam_file)
     features_list = []
     if features is not None:
@@ -709,7 +939,7 @@ if __name__ == "__main__":
         features_df.to_csv(output_path, index=False)
         print("Features have been written to", output_path)
 
-    # ????????? binSize, threshold, step_size, rd????????????????????
+    # Load pre-trained models for parameter prediction
     rf_window_size = joblib.load('rf_window_size_model.pkl')
     rf_threshold = joblib.load('rf_threshold_model.pkl')
     rf_step_size = joblib.load('rf_step_size_model.pkl')
@@ -722,12 +952,12 @@ if __name__ == "__main__":
     predicted_step_size = float(rf_step_size.predict(feature_vector)[0])
     predicted_rd = float(rf_rd_size.predict(feature_vector)[0])
 
-    # ????????????
+    # Set parameters based on predictions
     binSize = predicted_window_size
     threshold = predicted_threshold
     alpha = predicted_step_size
 
-    # ????????????????????
+    # Read the reference file and extract the sequence for the target chromosome
     refDict = read_ref_file(reference)
     if target_chr in refDict:
         refSeq = refDict[target_chr]
@@ -735,14 +965,14 @@ if __name__ == "__main__":
     else:
         raise ValueError("Reference file does not contain " + target_chr)
 
-    # ?????????????????????
+    # Initialize arrays for read counts and mapping quality
     ReadCount = np.full(chrLen, 0)
     Mapq = np.full(chrLen, 0)
 
-    # ?????????? read ?????????????bin_pos?
+    # Get read count and bin positions from the BAM file
     ReadCount, bin_pos, Mapq = get_RC(bam_file, ReadCount, Mapq, target_chr, chrLen)
 
-    # ?? ReadDepth??? ReadDepth ??????????? refSeq ? bin_pos?
+    # Compute read depth and GC content for bins
     bin_start, bin_end, bin_len, bin_RD, bin_gc = ReadDepth(ReadCount, refSeq, bin_pos)
 
     print("bin_RD length:", len(bin_RD))
@@ -765,14 +995,14 @@ if __name__ == "__main__":
     if np.isnan(mean_rd):
         print("Detailed check of bin_RD:", bin_RD)
 
-    # ???? R ???? CBS ??
+    # Write read depth values to a file and call an R script for CBS segmentation
     with open(outfile + '.txt', 'w') as file:
         for value in bin_RD:
             file.write(str(value) + '\n')
     subprocess.call('Rscript CBS_data.R ' + outfile, shell=True)
     os.remove(outfile + '.txt')
 
-    # ??????? Read_seg_file?resegment_RD?prox_tv1d ? PCC ???
+    # Process segmentation files, resegment read depth data, then perform total variation denoising and CNV calling
     seg_start, seg_end, seg_len, reseg_gc = Read_seg_file(bin_start, bin_len, bin_end, bin_gc)
     reseg_count, reseg_mq, reseg_start, reseg_end = resegment_RD(ReadCount, Mapq, seg_start, seg_end)
     reseg_mq /= reseg_count
