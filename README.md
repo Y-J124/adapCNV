@@ -4,11 +4,13 @@ adapCNV: A tool for detecting copy number variations by dynamically adjusting pa
 # install
 Uncompress the installation zip:
 
+```bash
 $ cd /my/install/dir/
-$ unzip /path/to/PEcnv.zip
-
+$ unzip /path/to/adapCNV.zip
+```
 # Usage
-python adapCNV-pro.py tumor.bam reference output max_binsize
-
+```bash
+$ python adapCNV-pro.py tumor.bam reference output max_binsize
+```
 # Maintainers
 @Y-J124
