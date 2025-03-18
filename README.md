@@ -1,16 +1,16 @@
 # adapCNV
 adapCNV: A tool for detecting copy number variations by dynamically adjusting parameters
 
-# install
+## install
 Uncompress the installation zip:
 
 ```bash
 $ cd /my/install/dir/
 $ unzip /path/to/adapCNV.zip
 ```
-# Usage
+## Usage
 ```bash
 $ python adapCNV-pro.py tumor.bam reference output max_binsize
 ```
-# Maintainers
+## Maintainers
 @Y-J124
