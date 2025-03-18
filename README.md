@@ -28,7 +28,7 @@ gzip
 re
 pyod.models.iforest
 
-``
+```
 ## Usage
 ```bash
 $ python adapCNV-pro.py tumor.bam reference output max_binsize
